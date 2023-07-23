@@ -1,0 +1,23 @@
+[
+  {
+    "range": [
+      0,
+      14
+    ],
+    "population": 24678
+  },
+  {
+    "range": [
+      15,
+      64
+    ],
+    "population": 96526
+  },
+  {
+    "range": [
+      65,
+      null
+    ],
+    "population": 20056
+  }
+]
