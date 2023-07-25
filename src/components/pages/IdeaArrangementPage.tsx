@@ -202,19 +202,34 @@ const use_ia_store = defineStore("idea_arrangement_store", () => {
   });
   /** 节点是否在矩形底部上方。 */
   function in_rect_up_side(xy: { x: number; y: number }, rect: DOMRect) {
-    if (xy.x >= rect.left && xy.x <= rect.right && xy.y < rect.top) {
+    if (xy.y < rect.bottom) {
       return true;
     } else {
       return false;
     }
   }
+
+  /** 判断点相对于矩形的方位：左边、矩形内、右边 */
+  function get_relative_position(xy: { x: number; y: number }, rect: DOMRect) {
+    if (xy.x < rect.left) {
+      return "left";
+    } else if (xy.x > rect.right) {
+      return "right";
+    } else {
+      return "inside";
+    }
+  }
+
   function get_mouse_on_node(
     node: TaskNode,
     pre: number[] = []
-  ): number[] | undefined {
+  ):
+    | { index: number[]; right_side: ReturnType<typeof get_relative_position> }
+    | undefined {
     const mp = mouse_place.value;
-    if (in_rect_up_side(mp, id_to_rect_map.value[node.id])) {
-      return pre;
+    const rect = id_to_rect_map.value[node.id];
+    if (in_rect_up_side(mp, rect)) {
+      return { index: pre, right_side: get_relative_position(mp, rect) };
     }
 
     if (node.type === "leaf") return;
@@ -233,9 +248,16 @@ const use_ia_store = defineStore("idea_arrangement_store", () => {
   }
 
   const mouse_on_node_index = computed(() => {
-    for (let index = 0; index < array.length; index++) {
-      const element = array[index];
-      
+    const children = root_task_tree.children;
+    for (let index = 0; index < children.length; index++) {
+      const child = children[index];
+
+      const result = get_mouse_on_node(child);
+      if (result === undefined) continue;
+
+      if (result.right_side) {
+        
+      }
     }
   });
 
