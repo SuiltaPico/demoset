@@ -72,6 +72,21 @@ function object_factory<TReferenceType>() {
   };
 }
 
+function preorder_traversal<TChild>(
+  processor: (child: TChild) => void,
+  get_children: () => TChild[] | undefined
+) {
+  return function traversal(tree: TChild) {
+    processor(tree);
+    const children = get_children();
+    if (children === undefined) return;
+
+    for (let index = 0; index < children.length; index++) {
+      traversal(children[index]);
+    }
+  };
+}
+
 interface Identifiable {
   id: string;
 }
@@ -185,6 +200,48 @@ const use_ia_store = defineStore("idea_arrangement_store", () => {
       y: mouse.y.value - (container.value?.offsetTop ?? 0),
     };
   });
+  /** 节点是否在矩形底部上方。 */
+  function in_rect_up_side(xy: { x: number; y: number }, rect: DOMRect) {
+    if (xy.x >= rect.left && xy.x <= rect.right && xy.y < rect.top) {
+      return true;
+    } else {
+      return false;
+    }
+  }
+  function get_mouse_on_node(
+    node: TaskNode,
+    pre: number[] = []
+  ): number[] | undefined {
+    const mp = mouse_place.value;
+    if (in_rect_up_side(mp, id_to_rect_map.value[node.id])) {
+      return pre;
+    }
+
+    if (node.type === "leaf") return;
+
+    const children = node.children;
+    for (let index = 0; index < children.length; index++) {
+      const new_pre = [...pre];
+      new_pre.push(index);
+      const child = children[index];
+      const result = get_mouse_on_node(child, new_pre);
+      if (result !== undefined) {
+        return result;
+      }
+      new_pre.pop();
+    }
+  }
+
+  const mouse_on_node_index = computed(() => {
+    for (let index = 0; index < array.length; index++) {
+      const element = array[index];
+      
+    }
+  });
+
+  const root_render_tree = computed(() => {
+    return root_task_tree;
+  });
 
   watch(moving, (new_value: boolean) => {
     if (new_value === true) {
@@ -271,10 +328,10 @@ export const TaskTreeRender = defineComponent<TaskTreeRenderProps>({
               y.value - offset_y.value - (ias.container?.offsetTop ?? 0)
             }px`,
           }}
-          onMousedown={handle_mouse_down}
         >
           <div
             class="frow gap-2 items-center bg-zinc-50 px-4 py-2 rounded shadow cursor-pointer"
+            onMousedown={handle_mouse_down}
             ref={box_el}
           >
             <div
@@ -420,7 +477,7 @@ export const IdeaArrangementPage = defineComponent({
           <div>
             <QBtn>添加游离节点</QBtn>
           </div>
-          <div class="frow relative flex-wrap" ref={node_container_el}>
+          <div class="frow gap-4 relative flex-wrap" ref={node_container_el}>
             {root_task_tree.children.map((it) => TaskNodeRender(it))}
           </div>
         </div>
