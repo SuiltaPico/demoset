@@ -1,8 +1,12 @@
 import { useMouse } from "@vueuse/core";
 import { nanoid } from "nanoid";
 import { defineStore } from "pinia";
-import { QBtn } from "quasar";
+import { QBtn, QSkeleton } from "quasar";
 import {
+  Ref,
+  RendererNode,
+  Transition,
+  TransitionGroup,
   computed,
   defineComponent,
   onMounted,
@@ -10,7 +14,8 @@ import {
   ref,
   watch,
 } from "vue";
-import { ItemsOf, UnionToIntersection } from "../../common/utils";
+import { ItemsOf, UnionToIntersection, vnode_if } from "../../common/utils";
+import { cloneDeep, defer, isEqual } from "lodash";
 
 function combine<
   const T extends (...arg: any) => any,
@@ -130,7 +135,17 @@ interface RenderTaskTree extends Identifiable {
 
 interface RenderPlaceholder extends Identifiable {
   type: "placeholder";
+  name?: string;
+  status?: TaskStatus;
 }
+
+const create_RenderPlaceholder: () => RenderPlaceholder = combine(
+  () =>
+    ({
+      type: "placeholder",
+    } as const),
+  create_Identifiable
+);
 
 type RenderTaskNode = RenderTaskLeaf | RenderTaskTree | RenderPlaceholder;
 
@@ -185,11 +200,13 @@ function get_color_from_status(status: TaskStatus) {
 
 const use_ia_store = defineStore("idea_arrangement_store", () => {
   const id_to_rect_map = ref<Record<string, DOMRect>>({});
+  const id_to_container_rect_map = ref<Record<string, DOMRect>>({});
   const id_to_api_map = ref<
     Record<
       string,
       {
         get_rect(): DOMRect;
+        get_container_rect(): DOMRect | undefined;
       }
     >
   >({});
@@ -197,17 +214,24 @@ const use_ia_store = defineStore("idea_arrangement_store", () => {
   const selected_queue: (() => void)[] = reactive([]);
   const moving = ref(false);
   const moving_id = ref("");
+  const moving_index = ref<number[]>([]);
+  const moving_offset = reactive({
+    x: 0,
+    y: 0,
+  });
   const container = ref<HTMLDivElement>();
   const root_task_tree = reactive(create_TaskTree("[root]"));
   const mouse = useMouse();
   const mouse_place = computed(() => {
+    const moving_rect = id_to_rect_map.value[moving_id.value];
     return {
       // x: mouse.x.value - (container.value?.offsetLeft ?? 0),
       // y: mouse.y.value - (container.value?.offsetTop ?? 0),
-      x: mouse.x.value,
-      y: mouse.y.value,
+      x: mouse.x.value - moving_offset.x,
+      y: mouse.y.value - moving_offset.y + (moving_rect?.height ?? 0) / 2,
     };
   });
+
   /** 节点是否在矩形底部上方。 */
   function in_rect_up_side(xy: { x: number; y: number }, rect: DOMRect) {
     if (xy.y < rect.bottom) {
@@ -230,27 +254,40 @@ const use_ia_store = defineStore("idea_arrangement_store", () => {
 
   function get_mouse_on_node(
     node: TaskNode,
-    pre: number[] = []
+    pre: number[] = [],
+    prev_node_indexes: Ref<number[]> = ref([])
   ):
     | { index: number[]; y: ReturnType<typeof get_relative_position> }
     | undefined {
     const mp = mouse_place.value;
+
+    if (moving_id.value === node.id) return;
+
     const rect = id_to_rect_map.value[node.id];
 
-    if (rect === undefined) return undefined;
+    if (rect === undefined) {
+      prev_node_indexes.value = [...pre];
+      return;
+    }
 
     if (in_rect_up_side(mp, rect)) {
+      prev_node_indexes.value = [...pre];
       return { index: pre, y: get_relative_position(mp, rect) };
     }
 
-    if (node.type === "leaf") return;
+    if (node.type === "leaf") {
+      prev_node_indexes.value = [...pre];
+      return;
+    }
+
+    prev_node_indexes.value = [...pre];
 
     const children = node.children;
     for (let index = 0; index < children.length; index++) {
       const new_pre = [...pre];
       new_pre.push(index);
       const child = children[index];
-      const result = get_mouse_on_node(child, new_pre);
+      const result = get_mouse_on_node(child, new_pre, prev_node_indexes);
       if (result !== undefined) {
         return result;
       }
@@ -282,22 +319,58 @@ const use_ia_store = defineStore("idea_arrangement_store", () => {
     return undefined;
   });
 
-  const root_render_tree = computed(() => {
-    const root_render_tree: RenderTaskTree = root_task_tree;
-    if (moving.value) {
-      // console.log(id_to_rect_map.value);
-      // console.log(container.value);
-      console.log(mouse_on_node_index.value);
+  function delete_indexes(node: RenderTaskNode, indexes?: number[]) {
+    if (node.type !== "tree" || indexes === undefined || indexes.length === 0)
+      return;
+    if (indexes.length === 1) {
+      node.children.splice(indexes[0], 1);
+    } else {
+      const child = node.children[indexes[0]];
+      delete_indexes(child, indexes.slice(1));
     }
-    return root_render_tree;
-  });
+  }
 
-  watch(moving, (new_value: boolean) => {
-    if (new_value === true) {
-      Object.entries(id_to_api_map.value).map(([id, api]) => {
-        id_to_rect_map.value[id] = api.get_rect();
-      });
+  function add_to_indexes(
+    new_node: RenderTaskNode,
+    node: RenderTaskNode,
+    indexes?: number[]
+  ) {
+    if (node.type !== "tree" || indexes === undefined || indexes.length === 0)
+      return;
+    if (indexes.length === 1) {
+      node.children.splice(indexes[0], 0, new_node);
+    } else {
+      const child = node.children[indexes[0]];
+      add_to_indexes(new_node, child, indexes.slice(1));
     }
+  }
+
+  let indexes: number[] | undefined;
+
+  const placeholder = reactive(create_RenderPlaceholder());
+
+  const root_render_tree = computed(() => {
+    const render_trees: RenderTaskTree = cloneDeep(root_task_tree);
+
+    function process_moving() {
+      if (moving.value) {
+        const new_indexes = mouse_on_node_index.value;
+
+        // if (isEqual(indexes, new_indexes)) return;
+        // else {
+        // delete_indexes(render_trees, indexes);
+        add_to_indexes(placeholder, render_trees, new_indexes);
+        indexes = new_indexes;
+        // }
+      } else {
+        // delete_indexes(render_trees, indexes);
+        indexes = undefined;
+      }
+    }
+
+    process_moving();
+
+    return render_trees;
   });
 
   return {
@@ -307,39 +380,136 @@ const use_ia_store = defineStore("idea_arrangement_store", () => {
     id_to_node_map,
     mouse_on_node_index,
     selected_queue,
-    moving,
-    moving_id,
     root_task_tree,
     root_render_tree,
+    set_moving(
+      value: boolean,
+      opt?: {
+        moving_id: string;
+        offset: { x: number; y: number };
+        source_indexes: number[];
+      }
+    ) {
+      if (value === true) {
+        if (opt) {
+          moving_id.value = opt.moving_id;
+          moving_offset.x = opt.offset.x;
+          moving_offset.y = opt.offset.y;
+
+          const node = id_to_node_map.value[opt.moving_id];
+          placeholder.name = node.name;
+          placeholder.status = get_TaskNode_status(node);
+
+          moving_index.value = opt.source_indexes;
+        }
+        defer(() => {
+          Object.entries(id_to_api_map.value).map(([id, api]) => {
+            id_to_rect_map.value[id] = api.get_rect();
+          });
+        });
+      } else {
+        const source_node = id_to_node_map.value[moving_id.value];
+        delete_indexes(root_task_tree, moving_index.value);
+        add_to_indexes(source_node, root_task_tree, mouse_on_node_index.value);
+      }
+
+      moving.value = value;
+    },
   };
 });
 
-export const TaskNodeRender = (task_node: RenderTaskNode) => {
-  if (task_node.type === "tree") {
-    return <TaskTreeRender modelValue={task_node}></TaskTreeRender>;
-  } else if (task_node.type === "leaf") {
-    return <TaskLeafRender modelValue={task_node}></TaskLeafRender>;
-  } else if (task_node.type === "placeholder") {
-    return "";
-  }
+type RenderTaskNodeCompoProps = {
+  modelValue: RenderTaskNode;
+  indexes: number[];
 };
+
+export const RenderTaskNodeCompo = defineComponent<RenderTaskNodeCompoProps>({
+  props: ["modelValue", "indexes"] as any,
+  setup(props, ctx) {
+    return () => {
+      const task_node = props.modelValue;
+      if (task_node.type === "tree") {
+        return (
+          <TaskTreeRender
+            modelValue={task_node}
+            key={task_node.id}
+            indexes={props.indexes}
+          ></TaskTreeRender>
+        );
+      } else if (task_node.type === "leaf") {
+        return (
+          <TaskLeafRender
+            modelValue={task_node}
+            key={task_node.id}
+            indexes={props.indexes}
+          ></TaskLeafRender>
+        );
+      } else if (task_node.type === "placeholder") {
+        return (
+          <RenderPlaceholderCompo
+            modelValue={task_node}
+            key={task_node.id}
+          ></RenderPlaceholderCompo>
+        );
+      }
+    };
+  },
+});
+
+type RenderPlaceholderCompoProps = {
+  modelValue: RenderPlaceholder;
+};
+
+export const RenderPlaceholderCompo =
+  defineComponent<RenderPlaceholderCompoProps>({
+    props: ["modelValue"] as any,
+    setup(props, ctx) {
+      return () => {
+        const ph = props.modelValue;
+        return (
+          <div class="min-h-10 bg-sky-100 shadow border border-sky-600 rounded frow gap-2 items-center px-4 py-2">
+            <div
+              class={[
+                get_color_from_status(ph.status ?? "ongoing"),
+                "rounded-full w-2 h-2",
+              ]}
+            ></div>
+            {vnode_if(
+              ph.name !== undefined,
+              () => (
+                <div>{ph.name}</div>
+              ),
+              () => (
+                <QSkeleton animation="none"></QSkeleton>
+              )
+            )}
+          </div>
+        );
+      };
+    },
+  });
 
 type TaskTreeRenderProps = {
   modelValue: RenderTaskTree;
+  indexes: number[];
 };
 export const TaskTreeRender = defineComponent<TaskTreeRenderProps>({
-  props: ["modelValue"] as any,
+  props: ["modelValue", "indexes"] as any,
   setup(props, ctx) {
     const ias = use_ia_store();
     const render_task_tree = props.modelValue;
     const task_tree = ias.id_to_node_map[render_task_tree.id];
 
     const box_el = ref<HTMLDivElement>();
+    const container_el = ref<HTMLDivElement>();
 
     onMounted(() => {
       ias.id_to_api_map[render_task_tree.id] = {
         get_rect() {
           return box_el.value!.getBoundingClientRect();
+        },
+        get_container_rect() {
+          return container_el.value!.getBoundingClientRect();
         },
       };
     });
@@ -360,14 +530,21 @@ export const TaskTreeRender = defineComponent<TaskTreeRenderProps>({
         move.value = false;
       });
 
-      ias.moving = true;
-      ias.moving_id = render_task_tree.id;
+      ias.set_moving(true, {
+        moving_id: props.modelValue.id,
+        offset: {
+          x: offset_x.value,
+          y: offset_y.value,
+        },
+        source_indexes: props.indexes,
+      });
 
       move.value = true;
       e.stopImmediatePropagation();
     }
 
     return () => {
+      const render_task_tree = props.modelValue;
       return (
         <div
           class={[
@@ -382,9 +559,13 @@ export const TaskTreeRender = defineComponent<TaskTreeRenderProps>({
               y.value - offset_y.value - (ias.container?.offsetTop ?? 0)
             }px`,
           }}
+          ref={container_el}
         >
           <div
-            class="frow gap-2 items-center bg-zinc-50 px-4 py-2 rounded shadow cursor-pointer"
+            class={[
+              "frow gap-2 items-center bg-zinc-50 px-4 py-2 rounded shadow cursor-pointer",
+              move.value ? `border border-sky-200` : "",
+            ]}
             onMousedown={handle_mouse_down}
             ref={box_el}
           >
@@ -397,7 +578,17 @@ export const TaskTreeRender = defineComponent<TaskTreeRenderProps>({
             <div>{render_task_tree.name}</div>
           </div>
           <div class="fcol gap-4 pl-6">
-            {render_task_tree.children.map((it) => TaskNodeRender(it))}
+            {render_task_tree.children.map((it, index) => (
+              <RenderTaskNodeCompo
+                modelValue={it}
+                key={it.id}
+                indexes={(() => {
+                  const new_indexes = props.indexes.slice();
+                  new_indexes.push(index);
+                  return new_indexes;
+                })()}
+              ></RenderTaskNodeCompo>
+            ))}
           </div>
         </div>
       );
@@ -407,9 +598,10 @@ export const TaskTreeRender = defineComponent<TaskTreeRenderProps>({
 
 type TaskLeafRenderProps = {
   modelValue: RenderTaskLeaf;
+  indexes: number[];
 };
 export const TaskLeafRender = defineComponent<TaskLeafRenderProps>({
-  props: ["modelValue"] as any,
+  props: ["modelValue", "indexes"] as any,
   setup(props, ctx) {
     const ias = use_ia_store();
     const render_task_leaf = props.modelValue;
@@ -420,6 +612,9 @@ export const TaskLeafRender = defineComponent<TaskLeafRenderProps>({
       ias.id_to_api_map[render_task_leaf.id] = {
         get_rect() {
           return box_el.value!.getBoundingClientRect();
+        },
+        get_container_rect() {
+          return undefined;
         },
       };
     });
@@ -439,12 +634,19 @@ export const TaskLeafRender = defineComponent<TaskLeafRenderProps>({
       ias.selected_queue.push(() => {
         move.value = false;
       });
-      ias.moving = true;
-
+      ias.set_moving(true, {
+        moving_id: props.modelValue.id,
+        offset: {
+          x: offset_x.value,
+          y: offset_y.value,
+        },
+        source_indexes: props.indexes,
+      });
       move.value = true;
       e.stopImmediatePropagation();
     }
     return () => {
+      const render_task_leaf = props.modelValue;
       return (
         <div
           class={[
@@ -462,7 +664,10 @@ export const TaskLeafRender = defineComponent<TaskLeafRenderProps>({
           onMousedown={handle_mouse_down}
         >
           <div
-            class="frow gap-2 items-center bg-zinc-50 px-4 py-2 rounded shadow"
+            class={[
+              "frow gap-2 items-center bg-zinc-50 px-4 py-2 rounded shadow",
+              move.value ? "" : "",
+            ]}
             ref={box_el}
           >
             <div
@@ -501,7 +706,7 @@ export const IdeaArrangementPage = defineComponent({
 
     function cancel_move_status() {
       ias.selected_queue.forEach((it) => it());
-      ias.moving = false;
+      ias.set_moving(false);
     }
 
     onMounted(() => {
@@ -544,7 +749,13 @@ export const IdeaArrangementPage = defineComponent({
             <QBtn>添加游离节点</QBtn>
           </div>
           <div class="frow gap-4 relative flex-wrap" ref={node_container_el}>
-            {ias.root_render_tree.children.map((it) => TaskNodeRender(it))}
+            {ias.root_render_tree.children.map((it, index) => (
+              <RenderTaskNodeCompo
+                modelValue={it}
+                indexes={[index]}
+                key={it.id}
+              ></RenderTaskNodeCompo>
+            ))}
           </div>
         </div>
       );
